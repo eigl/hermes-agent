@@ -23,6 +23,7 @@ Usage::
         print(result["transcript"])
 """
 
+import ctypes
 import logging
 import os
 import shlex
@@ -72,6 +73,15 @@ DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest"
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+COMMON_CUDA_LIB_DIRS = (
+    "/usr/local/cuda/targets/x86_64-linux/lib",
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda-13/targets/x86_64-linux/lib",
+    "/usr/local/cuda-13/lib64",
+    "/usr/local/cuda-13.2/targets/x86_64-linux/lib",
+    "/usr/local/cuda-13.2/lib64",
+)
+CUDA_COMPAT_DIRNAME = "cuda-compat"
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -324,8 +334,60 @@ def _is_cuda_runtime_error(exc: Exception) -> bool:
     return any(snippet in message for snippet in CUDA_FALLBACK_ERROR_SNIPPETS)
 
 
+def _prepend_env_path(var_name: str, path: str) -> None:
+    current = os.environ.get(var_name, "")
+    parts = [part for part in current.split(":") if part]
+    if path in parts:
+        return
+    os.environ[var_name] = ":".join([path, *parts]) if parts else path
+
+
+def _get_cuda_compat_dir() -> Path:
+    return get_hermes_home() / "cache" / CUDA_COMPAT_DIRNAME
+
+
+def _ensure_cuda_compat_symlink(*, compat_name: str, target_name: str, search_dirs: tuple[str, ...] = COMMON_CUDA_LIB_DIRS) -> Optional[str]:
+    compat_dir = _get_cuda_compat_dir()
+    compat_dir.mkdir(parents=True, exist_ok=True)
+
+    for directory in search_dirs:
+        target_path = Path(directory) / target_name
+        if not target_path.exists():
+            continue
+        compat_path = compat_dir / compat_name
+        if compat_path.exists() or compat_path.is_symlink():
+            compat_path.unlink()
+        compat_path.symlink_to(target_path)
+        return str(compat_path)
+    return None
+
+
+def _configure_cuda_runtime_compatibility() -> None:
+    compat_blas = _ensure_cuda_compat_symlink(compat_name="libcublas.so.12", target_name="libcublas.so.13")
+    compat_blas_lt = _ensure_cuda_compat_symlink(compat_name="libcublasLt.so.12", target_name="libcublasLt.so.13")
+
+    for directory in COMMON_CUDA_LIB_DIRS:
+        if Path(directory).exists():
+            _prepend_env_path("LD_LIBRARY_PATH", directory)
+            break
+    if compat_blas:
+        _prepend_env_path("LD_LIBRARY_PATH", str(_get_cuda_compat_dir()))
+
+    for library in (compat_blas_lt, compat_blas):
+        if not library:
+            continue
+        try:
+            ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            logger.debug("Failed to preload CUDA compatibility library: %s", library, exc_info=True)
+
+
+
 def _load_local_whisper_model(model_name: str, *, device: str = "auto", compute_type: str = "auto") -> object:
     global _local_model, _local_model_name, _local_model_device
+
+    if device != "cpu":
+        _configure_cuda_runtime_compatibility()
 
     from faster_whisper import WhisperModel
 

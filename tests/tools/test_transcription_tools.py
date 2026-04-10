@@ -542,6 +542,30 @@ class TestTranscribeLocalExtended:
         assert result["transcript"] == "Hello world"
 
 
+class TestCudaRuntimeCompatibility:
+    def test_creates_cuda12_compat_symlinks_from_cuda13(self, tmp_path, monkeypatch):
+        cuda_dir = tmp_path / "cuda"
+        cuda_dir.mkdir()
+        (cuda_dir / "libcublas.so.13").write_text("blas")
+        (cuda_dir / "libcublasLt.so.13").write_text("blaslt")
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+
+        with patch("tools.transcription_tools.COMMON_CUDA_LIB_DIRS", (str(cuda_dir),)), \
+             patch("tools.transcription_tools.ctypes.CDLL") as mock_cdll:
+            from tools.transcription_tools import _configure_cuda_runtime_compatibility, _get_cuda_compat_dir
+            _configure_cuda_runtime_compatibility()
+
+        compat_dir = _get_cuda_compat_dir()
+        assert (compat_dir / "libcublas.so.12").is_symlink()
+        assert (compat_dir / "libcublasLt.so.12").is_symlink()
+        assert os.environ["LD_LIBRARY_PATH"].startswith(f"{compat_dir}:{cuda_dir}")
+        assert mock_cdll.call_count == 2
+
+
 # ============================================================================
 # Model auto-correction
 # ============================================================================
