@@ -87,6 +87,15 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+_local_model_device: Optional[str] = None
+
+
+CUDA_FALLBACK_ERROR_SNIPPETS = (
+    "libcublas",
+    "cuda",
+    "cudnn",
+    "cublas",
+)
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -94,7 +103,7 @@ _local_model_name: Optional[str] = None
 
 
 def get_stt_model_from_config() -> Optional[str]:
-    """Read the STT model name from ~/.hermes/config.yaml.
+    """Read the effective STT model name from ~/.hermes/config.yaml.
 
     Provider-aware: reads from the correct provider-specific section
     (``stt.local.model``, ``stt.openai.model``, etc.).  Falls back to
@@ -310,21 +319,46 @@ def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _is_cuda_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(snippet in message for snippet in CUDA_FALLBACK_ERROR_SNIPPETS)
+
+
+def _load_local_whisper_model(model_name: str, *, device: str = "auto", compute_type: str = "auto") -> object:
+    global _local_model, _local_model_name, _local_model_device
+
+    from faster_whisper import WhisperModel
+
+    if (
+        _local_model is None
+        or _local_model_name != model_name
+        or _local_model_device != device
+    ):
+        logger.info(
+            "Loading faster-whisper model '%s' (device=%s, compute_type=%s; first load may download the model)...",
+            model_name,
+            device,
+            compute_type,
+        )
+        _local_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        _local_model_name = model_name
+        _local_model_device = device
+    return _local_model
+
+
+def _reset_local_whisper_model() -> None:
+    global _local_model, _local_model_name, _local_model_device
+    _local_model = None
+    _local_model_name = None
+    _local_model_device = None
+
+
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
-    global _local_model, _local_model_name
-
     if not _HAS_FASTER_WHISPER:
         return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
     try:
-        from faster_whisper import WhisperModel
-        # Lazy-load the model (downloads on first use, ~150 MB for 'base')
-        if _local_model is None or _local_model_name != model_name:
-            logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = WhisperModel(model_name, device="auto", compute_type="auto")
-            _local_model_name = model_name
-
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
         _forced_lang = (
             _load_stt_config().get("local", {}).get("language")
@@ -335,7 +369,21 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
-        segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+        try:
+            model = _load_local_whisper_model(model_name)
+            segments, info = model.transcribe(file_path, **transcribe_kwargs)
+        except Exception as exc:
+            if not _is_cuda_runtime_error(exc):
+                raise
+
+            logger.warning(
+                "Local STT hit a CUDA runtime error (%s); retrying on CPU.",
+                exc,
+            )
+            _reset_local_whisper_model()
+            model = _load_local_whisper_model(model_name, device="cpu", compute_type="int8")
+            segments, info = model.transcribe(file_path, **transcribe_kwargs)
+
         transcript = " ".join(segment.text.strip() for segment in segments)
 
         logger.info(
