@@ -2844,9 +2844,11 @@ class GatewayRunner:
                 if is_audio:
                     audio_paths.append(path)
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
+                message_text, transcripts = await self._enrich_message_with_transcription(
                     message_text, audio_paths
                 )
+                if transcripts:
+                    await self._echo_transcribed_text(event, transcripts)
                 # If STT failed, send a direct message to the user so they
                 # know voice isn't configured — don't rely on the agent to
                 # relay the error clearly.
@@ -6207,17 +6209,17 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
-    ) -> str:
+    ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
 
         Args:
-            user_text:   The user's original caption / message text.
+            user_text: The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
 
         Returns:
-            The enriched message string with transcriptions prepended.
+            Tuple of (enriched message text, successful transcript list).
         """
         if not getattr(self.config, "stt_enabled", True):
             disabled_note = "[The user sent voice message(s), but transcription is disabled in config."
@@ -6228,23 +6230,26 @@ class GatewayRunner:
                 )
             disabled_note += "]"
             if user_text:
-                return f"{disabled_note}\n\n{user_text}"
-            return disabled_note
+                return f"{disabled_note}\n\n{user_text}", []
+            return disabled_note, []
 
         from tools.transcription_tools import transcribe_audio
         import asyncio
 
         enriched_parts = []
+        transcripts: List[str] = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
-                    transcript = result["transcript"]
+                    transcript = (result.get("transcript") or "").strip()
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
                     )
+                    if transcript:
+                        transcripts.append(transcript)
                 else:
                     error = result.get("error", "unknown error")
                     if (
@@ -6283,11 +6288,39 @@ class GatewayRunner:
             # when we successfully transcribed the audio — it's redundant.
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
+                return prefix, transcripts
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+                return f"{prefix}\n\n{user_text}", transcripts
+            return prefix, transcripts
+        return user_text, transcripts
+
+    async def _echo_transcribed_text(
+        self,
+        event: MessageEvent,
+        transcripts: List[str],
+    ) -> None:
+        if not transcripts:
+            return
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter:
+            return
+
+        if len(transcripts) == 1:
+            echo = f"Transcribed: {transcripts[0]}"
+        else:
+            numbered = "\n".join(f"{i}. {text}" for i, text in enumerate(transcripts, start=1))
+            echo = f"Transcribed:\n{numbered}"
+
+        metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        try:
+            await adapter.send(
+                event.source.chat_id,
+                echo,
+                reply_to=event.message_id,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning("Failed to echo transcript before agent processing: %s", exc)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
