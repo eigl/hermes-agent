@@ -32,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -790,20 +791,28 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
           - "transcript" (str): The transcribed text (empty on failure)
           - "error" (str, optional): Error message if success is False
           - "provider" (str, optional): Which provider was used
+          - "elapsed_seconds" (float): Wall-clock transcription time
     """
+    started_at = time.perf_counter()
+
+    def _with_elapsed(result: Dict[str, Any]) -> Dict[str, Any]:
+        annotated = dict(result)
+        annotated["elapsed_seconds"] = round(time.perf_counter() - started_at, 3)
+        return annotated
+
     # Validate input
     error = _validate_audio_file(file_path)
     if error:
-        return error
+        return _with_elapsed(error)
 
     # Load config and determine provider
     stt_config = _load_stt_config()
     if not is_stt_enabled(stt_config):
-        return {
+        return _with_elapsed({
             "success": False,
             "transcript": "",
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
-        }
+        })
 
     provider = _get_provider(stt_config)
 
@@ -812,28 +821,28 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = _normalize_local_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
-        return _transcribe_local(file_path, model_name)
+        return _with_elapsed(_transcribe_local(file_path, model_name))
 
     if provider == "local_command":
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_command_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
-        return _transcribe_local_command(file_path, model_name)
+        return _with_elapsed(_transcribe_local_command(file_path, model_name))
 
     if provider == "groq":
         model_name = model or DEFAULT_GROQ_STT_MODEL
-        return _transcribe_groq(file_path, model_name)
+        return _with_elapsed(_transcribe_groq(file_path, model_name))
 
     if provider == "openai":
         openai_cfg = stt_config.get("openai", {})
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(file_path, model_name)
+        return _with_elapsed(_transcribe_openai(file_path, model_name))
 
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral", {})
         model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
-        return _transcribe_mistral(file_path, model_name)
+        return _with_elapsed(_transcribe_mistral(file_path, model_name))
 
     if provider == "xai":
         xai_cfg = stt_config.get("xai", {})
@@ -842,7 +851,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         return _transcribe_xai(file_path, model_name)
 
     # No provider available
-    return {
+    return _with_elapsed({
         "success": False,
         "transcript": "",
         "error": (
@@ -852,7 +861,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
-    }
+    })
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:

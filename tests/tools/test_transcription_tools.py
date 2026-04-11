@@ -816,6 +816,17 @@ class TestTranscribeAudioDispatch:
         assert result["success"] is True
         mock_local.assert_called_once()
 
+    def test_adds_elapsed_seconds_to_result(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._transcribe_local",
+                   return_value={"success": True, "transcript": "hi"}), \
+             patch("tools.transcription_tools.time.perf_counter", side_effect=[10.0, 10.456]):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["elapsed_seconds"] == 0.456
+
     def test_dispatches_to_openai(self, sample_ogg):
         with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openai"}), \
              patch("tools.transcription_tools._get_provider", return_value="openai"), \
